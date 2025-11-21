@@ -5,8 +5,17 @@ import pandas as pd
 import os
 from datetime import datetime, timedelta
 from cachetools import cached, TTLCache
+import joblib
+from pydantic import BaseModel
+from typing import List
 
 app = FastAPI()
+
+class PredictionFeatures(BaseModel):
+    temperature_2m_mean: float
+    precipitation_sum: float
+    Commodity: str
+    Variety: str
 
 # Allow CORS for frontend development
 app.add_middleware(
@@ -21,6 +30,15 @@ DATA_DIR = "data"
 
 # In-memory cache for 15 minutes
 data_cache = TTLCache(maxsize=100, ttl=900)
+
+# Load the trained model and model columns
+try:
+    model = joblib.load('models/price_risk_model.joblib')
+    model_columns = joblib.load('models/model_columns.joblib')
+except FileNotFoundError:
+    model = None
+    model_columns = None
+    print("Warning: Model not found. The /predict endpoint will not work.")
 
 # Load mock data with caching
 @cached(data_cache)
@@ -63,6 +81,40 @@ async def get_commodities(location_id: str):
                 commodities.add(parts[3])
     return list(commodities)
 
+@app.post("/predict")
+async def predict(features: PredictionFeatures):
+    if not model or not model_columns:
+        raise HTTPException(status_code=500, detail="Model not loaded.")
+
+    # Create a DataFrame for the prediction
+    df_pred = pd.DataFrame(columns=model_columns)
+    df_pred.loc[0] = 0  # Initialize with zeros
+
+    # Fill in the known values
+    df_pred['temperature_2m_mean'] = features.temperature_2m_mean
+    df_pred['precipitation_sum'] = features.precipitation_sum
+    
+    # One-hot encode the commodity and variety
+    commodity_col = f"Commodity_{features.Commodity}"
+    if commodity_col in df_pred.columns:
+        df_pred[commodity_col] = 1
+        
+    variety_col = f"Variety_{features.Variety}"
+    if variety_col in df_pred.columns:
+        df_pred[variety_col] = 1
+
+    # Make prediction
+    prediction = model.predict(df_pred)
+    prediction_proba = model.predict_proba(df_pred)
+
+    return {
+        "prediction": int(prediction[0]),
+        "prediction_probability": {
+            "no_risk": prediction_proba[0][0],
+            "price_risk": prediction_proba[0][1]
+        }
+    }
+    
 @app.get("/")
 async def read_root():
     return {"message": "Welcome to KrishiShield Backend API"}
