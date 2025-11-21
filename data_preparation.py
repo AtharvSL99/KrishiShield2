@@ -111,7 +111,7 @@ def create_lagged_features(df_weekly, lag_window=LAG_WINDOW):
     return df_lagged
 
 if __name__ == "__main__":
-    file_path = 'test.csv' 
+    file_path = 'semifinal.csv' 
     df = load_data(file_path)
     df_cleaned = drop_redundant_columns(df)
     df_time_series = preprocess_and_aggregate_weekly(df_cleaned, commodity=TARGET_COMMODITY)
