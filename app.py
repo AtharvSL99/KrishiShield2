@@ -11,13 +11,11 @@ from io import StringIO
 # --- Configuration ---
 PRIMARY_DATA_FILE = 'semifinal.csv'
 FALLBACK_DATA_FILE = 'test.csv'
-MODEL_FILE = 'Onion.pkl'
-SCALER_FILE = 'scaler.pkl'
+CACHE_FILE = 'offline_weather_cache.csv'
 LAG_WINDOW = 4
-DEFAULT_COMMODITY = 'Onion'
 PRICE_COLUMN = 'Modal_Price'
 
-# --- 1. Data Loading & Setup ---
+# --- 1. Data Loading ---
 
 @st.cache_data
 def load_base_data():
@@ -47,6 +45,7 @@ def get_market_coordinates():
         df.columns = df.columns.str.strip()
         if 'Market Name' in df.columns:
             df['Market Name'] = df['Market Name'].astype(str).str.strip()
+        
         if 'latitude_x' in df.columns and 'longitude_x' in df.columns:
             coords = df[['Market Name', 'latitude_x', 'longitude_x']].drop_duplicates().set_index('Market Name')
             return coords.to_dict('index')
@@ -56,116 +55,184 @@ def get_market_coordinates():
 
 @st.cache_data
 def get_seasonal_averages(commodity, market_name, target_month):
-    """Calculates historical averages for filling gaps."""
-    file_to_load = PRIMARY_DATA_FILE if os.path.exists(PRIMARY_DATA_FILE) else FALLBACK_DATA_FILE
+    """Calculates historical averages from commodity-specific files."""
+    file_name = f'{commodity.lower()}_market_lagged_features.csv'
     defaults = {
         'Modal_Price': 2500.0, 'temperature_2m_max': 30.0, 'temperature_2m_min': 20.0,
         'temperature_2m_mean': 25.0, 'precipitation_sum': 0.0, 'precipitation_hours': 0.0,
         'wind_speed_10m_max': 10.0, 'weather_code': 0.0
     }
-    try:
-        df = pd.read_csv(file_to_load, index_col=False)
-        df.columns = df.columns.str.strip()
-        target_market = str(market_name).strip().lower()
-        date_col = 'Price Date' if 'Price Date' in df.columns else 'Date'
-        
-        if date_col in df.columns:
-            df[date_col] = pd.to_datetime(df[date_col])
-            df_filtered = df[
-                (df['Commodity'] == commodity) & 
-                (df['Market Name'].str.lower().str.strip() == target_market) & 
-                (df[date_col].dt.month == target_month)
-            ]
-            if df_filtered.empty:
-                df_filtered = df[(df['Commodity'] == commodity) & (df[date_col].dt.month == target_month)]
+    
+    if not os.path.exists(file_name): return defaults
 
-            if not df_filtered.empty:
-                means = df_filtered.mean(numeric_only=True)
-                for col in defaults.keys():
-                    if col in means: defaults[col] = means[col]
+    try:
+        df = pd.read_csv(file_name, index_col=[0, 1], parse_dates=True)
+        df.index.names = ['Market Name', 'Price Date']
+        try:
+            df_market = df.xs(market_name, level='Market Name', drop_level=False)
+        except KeyError:
+            return defaults
+
+        df_month = df_market[df_market.index.get_level_values('Price Date').month == target_month]
+        if not df_month.empty:
+            means = df_month.mean(numeric_only=True)
+            for col in defaults.keys():
+                if col in means: defaults[col] = means[col]
+        else:
+            means = df_market.mean(numeric_only=True)
+            for col in defaults.keys():
+                if col in means: defaults[col] = means[col]
         return defaults
-    except:
+    except Exception:
         return defaults
 
 @st.cache_resource
-def load_artifacts():
-    """Loads model/scaler, forcing CPU."""
+def load_artifacts(commodity_name):
+    """Loads model/scaler dynamically based on crop name."""
+    model_filename = f"{commodity_name}.pkl"
+    scaler_filename = f"{commodity_name.lower()}_scaler.pkl"
+    
     try:
-        with open(MODEL_FILE, 'rb') as f:
+        with open(model_filename, 'rb') as f:
             model = pickle.load(f)
         if isinstance(model, xgb.XGBRegressor):
             model.set_params(device='cpu', tree_method='hist')
             try:
                 model.get_booster().set_param({'device': 'cpu', 'tree_method': 'hist'})
             except: pass
-        with open(SCALER_FILE, 'rb') as f:
+        with open(scaler_filename, 'rb') as f:
             scaler = pickle.load(f)
         return model, scaler
     except FileNotFoundError:
         return None, None
 
-# --- 2. Unified API (History + Forecast) ---
+# --- 2. ROBUST Caching System ---
+
+def update_weather_cache(new_data, lat, lon):
+    """
+    Safely updates the cache by reading the old file, merging, and overwriting.
+    Prevents CSV corruption from blind appending.
+    """
+    try:
+        df_new = new_data.copy()
+        df_new['lat'] = round(lat, 4)
+        df_new['lon'] = round(lon, 4)
+        
+        if os.path.exists(CACHE_FILE):
+            try:
+                df_old = pd.read_csv(CACHE_FILE, index_col='Date', parse_dates=True)
+                # Combine old and new
+                df_combined = pd.concat([df_old, df_new])
+                # Remove duplicates based on index (Date) and Location
+                # We reset index to include Date in duplicate check
+                df_combined = df_combined.reset_index().drop_duplicates(subset=['Date', 'lat', 'lon'], keep='last').set_index('Date')
+                df_combined.to_csv(CACHE_FILE)
+            except Exception:
+                # If read failed (corrupt file), just overwrite
+                df_new.to_csv(CACHE_FILE)
+        else:
+            df_new.to_csv(CACHE_FILE)
+    except Exception as e:
+        print(f"Cache Write Error: {e}")
+
+def load_weather_from_cache(lat, lon, start_date, end_date):
+    """
+    Retrieves data from cache. 
+    Fallback: If exact date range missing, returns MOST RECENT data for that location.
+    """
+    if not os.path.exists(CACHE_FILE):
+        return pd.DataFrame(), "Cache Empty"
+    
+    try:
+        df = pd.read_csv(CACHE_FILE, index_col='Date', parse_dates=True)
+        
+        # Filter by Location (approximate match)
+        lat_mask = (df['lat'] >= lat - 0.1) & (df['lat'] <= lat + 0.1)
+        lon_mask = (df['lon'] >= lon - 0.1) & (df['lon'] <= lon + 0.1)
+        df_loc = df[lat_mask & lon_mask].copy()
+        
+        if df_loc.empty:
+            return pd.DataFrame(), "No Data for Location"
+            
+        # 1. Try Exact Range
+        mask_date = (df_loc.index >= pd.Timestamp(start_date)) & (df_loc.index <= pd.Timestamp(end_date))
+        df_range = df_loc[mask_date]
+        
+        if not df_range.empty and (df_range.index.max() - df_range.index.min()).days >= 20:
+             return df_range.sort_index().drop(columns=['lat', 'lon']), "Offline Cache (Exact)"
+             
+        # 2. Fallback: Get the most recent 25 days available
+        # This allows "Stale" data usage if offline
+        df_loc = df_loc.sort_index()
+        last_date = df_loc.index.max()
+        fallback_start = last_date - timedelta(days=25)
+        df_fallback = df_loc[df_loc.index >= fallback_start]
+        
+        return df_fallback.drop(columns=['lat', 'lon']), f"Offline Cache (Last Updated: {last_date.date()})"
+        
+    except Exception as e:
+        return pd.DataFrame(), f"Cache Read Error: {e}"
+
+# --- 3. Fetch Logic ---
 
 def fetch_unified_weather(lat, lon):
     """
-    Fetches a continuous block of weather data:
-    - Past 7 days (Observed History)
-    - Next 16 days (Forecast)
-    Total: ~23 days of continuous data.
+    Fetches weather data. Tries Online first, falls back to Cache.
     """
+    today = date.today()
+    start_date = today - timedelta(days=7)
+    end_date = today + timedelta(days=16)
+    
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        "latitude": lat,
-        "longitude": lon,
+        "latitude": lat, "longitude": lon,
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,precipitation_hours,wind_speed_10m_max",
-        "timezone": "auto",
-        "past_days": 7,      # Week 0 (Observed)
-        "forecast_days": 16  # Weeks 1-2 (Forecast)
+        "timezone": "auto", "past_days": 7, "forecast_days": 16
     }
     
+    # 1. Try Online
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=3) # Fast timeout
         r.raise_for_status()
         data = r.json()
-        
         daily_data = data.get('daily', {})
         df = pd.DataFrame(daily_data)
+        
         if not df.empty:
-            df['time'] = pd.to_datetime(df['time'])
-            df = df.set_index('time')
-            df.index.name = 'Date'
-        return df
-    except Exception as e:
-        st.error(f"Weather API Error: {e}")
-        return pd.DataFrame()
+            df['Date'] = pd.to_datetime(df['time'])
+            df = df.set_index('Date').drop(columns=['time'])
+            # Save to Cache
+            update_weather_cache(df, lat, lon)
+            return df, "Open-Meteo API (Live)"
+    except Exception:
+        pass # Fail silently to offline mode
+        
+    # 2. Try Cache
+    st.warning("⚠️ Internet unreachable. Switching to Offline Mode.")
+    df_cache, status_msg = load_weather_from_cache(lat, lon, start_date, end_date)
+    
+    if not df_cache.empty:
+        return df_cache, status_msg
+        
+    return pd.DataFrame(), status_msg
 
-# --- 3. Scenario Builder ---
+# --- 4. Scenario Builder ---
 
 def build_hybrid_scenario(df_api, historical_avgs):
-    """
-    Stitches the timeline:
-    1. API Data (Observed + Forecast) -> Approx 3 weeks
-    2. Historical Averages (Projection) -> Fills Week 4 to complete the lag window
-    """
-    # 1. Start with API data
+    """Stitches API data with historical projections."""
     df_scenario = df_api.copy()
     
-    # 2. We need a total of roughly 28-30 days to form 4 weekly lags
-    # API gives ~23 days. We need to project the rest.
     last_api_date = df_scenario.index.max()
     start_date = df_scenario.index.min()
-    
-    # Determine how many more days needed to reach 4 weeks (28 days)
     current_duration = (last_api_date - start_date).days
     days_needed = max(0, 28 - current_duration)
     
-    # 3. Append Historical Projection
     if days_needed > 0:
         projection_rows = []
         current_date = last_api_date + timedelta(days=1)
-        for _ in range(days_needed + 1): # +1 buffer
+        for _ in range(days_needed + 1): 
             row = historical_avgs.copy()
-            row.pop('Modal_Price', None) # Don't put price in weather columns
+            row.pop('Modal_Price', None) 
             row['Date'] = current_date
             projection_rows.append(row)
             current_date += timedelta(days=1)
@@ -173,9 +240,7 @@ def build_hybrid_scenario(df_api, historical_avgs):
         df_proj = pd.DataFrame(projection_rows).set_index('Date')
         df_scenario = pd.concat([df_scenario, df_proj])
     
-    # 4. Add Constant Baseline Price
     df_scenario['Modal_Price'] = historical_avgs['Modal_Price']
-    
     return df_scenario
 
 def aggregate_to_weekly_lags(df_daily):
@@ -187,52 +252,23 @@ def aggregate_to_weekly_lags(df_daily):
         'Modal_Price': 'mean' 
     }
     
-    # Ensure cols exist
     for col in agg_rules:
         if col not in df_daily.columns: df_daily[col] = 0
             
-    # Resample '7D' starting from the first day
     df_weekly = df_daily.resample('7D', origin='start').agg(agg_rules)
-    
-    # Take first 4 weeks
     df_weekly = df_weekly.iloc[:LAG_WINDOW]
     
-    # If short, pad with last known
     while len(df_weekly) < LAG_WINDOW:
         last_row = df_weekly.iloc[[-1]].copy()
         last_row.index = last_row.index + timedelta(days=7)
         df_weekly = pd.concat([df_weekly, last_row])
-        
-    # Reverse for Model Input (Row 0 = Most Recent/Future-most Week)
-    # For the model:
-    # Lag 1 = The week closest to the target date (The "Future")
-    # Lag 4 = The week furthest away (The "Past/Observed")
-    
-    # The resampling is chronological:
-    # Row 0: Week 0 (Past/Observed)
-    # Row 1: Week 1 (Forecast)
-    # Row 2: Week 2 (Forecast)
-    # Row 3: Week 3 (Projection)
-    
-    # We need to REVERSE this so:
-    # Lag 1 <- Row 3 (Projection/Future)
-    # Lag 2 <- Row 2
-    # Lag 3 <- Row 1
-    # Lag 4 <- Row 0 (Past)
     
     recent_weeks = df_weekly.iloc[::-1]
-    
     simulated_data = []
-    sources = ["Projection (Hist. Avg)", "Forecast (API)", "Forecast (API)", "Observed (API)"]
-    
     for i in range(len(recent_weeks)):
         row = recent_weeks.iloc[i]
-        # Guard bounds for source label
-        src_label = sources[i] if i < len(sources) else "Projection"
-        
         simulated_data.append({
             'Week_Start': recent_weeks.index[i].strftime('%Y-%m-%d'),
-            'Data_Source': src_label,
             f'{PRICE_COLUMN}_Lag1': row['Modal_Price'],
             'temperature_2m_max': row['temperature_2m_max'],
             'precipitation_sum': row['precipitation_sum'],
@@ -242,64 +278,78 @@ def aggregate_to_weekly_lags(df_daily):
             'wind_speed_10m_max': row['wind_speed_10m_max'],
             'precipitation_hours': row['precipitation_hours'],
         })
-        
-    return simulated_data, df_weekly
+    return simulated_data
 
 def prepare_input_features(simulated_data, model_features, baseline_price):
     """Aligns user input with model features."""
     X_pred = pd.DataFrame(0.0, index=[0], columns=model_features)
-    
     for lag in range(1, LAG_WINDOW + 1):
         data = simulated_data[lag-1]
         for col in ['temperature_2m_mean', 'temperature_2m_max', 'temperature_2m_min', 
                    'wind_speed_10m_max', 'precipitation_sum', 'precipitation_hours', 'weather_code']:
-            if col in data:
-                X_pred.loc[0, f'{col}_Lag{lag}'] = data[col]
+            if col in data: X_pred.loc[0, f'{col}_Lag{lag}'] = data[col]
         X_pred.loc[0, f'{PRICE_COLUMN}_Lag{lag}'] = baseline_price
 
     if simulated_data:
         proxy = simulated_data[0]
         for col in ['temperature_2m_mean', 'temperature_2m_max', 'temperature_2m_min', 
                    'wind_speed_10m_max', 'precipitation_sum', 'precipitation_hours', 'weather_code']:
-            if col in X_pred.columns and col in proxy:
-                X_pred.loc[0, col] = proxy[col]
-            
+            if col in X_pred.columns and col in proxy: X_pred.loc[0, col] = proxy[col]
     return X_pred
 
 # --- Main App ---
 
 def main():
     st.set_page_config(page_title="Crop Risk Calculator", layout="wide")
-    st.title(f"🌾 {DEFAULT_COMMODITY} Future Risk Calculator")
-    st.markdown("""
-    **Rolling Horizon Analysis:** Combines **Observed** (Past Week) + **Forecast** (Next 2 Weeks) + **Projection** (Week 4) 
-    to estimate price risk ~1 month from today.
-    """)
-    
     df_base = load_base_data()
-    model, scaler = load_artifacts()
     market_coords = get_market_coordinates() 
     
-    if df_base.empty or model is None:
-        st.error("System Error: Missing Data or Model.")
+    if df_base.empty:
+        st.error("System Error: Missing Data File (semifinal.csv or test.csv).")
         st.stop()
         
-    # --- Sidebar ---
+    # Sidebar
+    st.sidebar.header("Crop Selection")
+    available_crops = ["Onion", "Wheat", "Potato"]
+    selected_crop = st.sidebar.selectbox("Select Crop", available_crops)
+    
+    st.sidebar.divider()
     st.sidebar.header("Location")
-    markets = sorted(df_base['Market Name'].unique())
-    market = st.sidebar.selectbox("Select Market", markets)
+    
+    if 'Commodity' in df_base.columns:
+        valid_markets = sorted(df_base[df_base['Commodity'] == selected_crop]['Market Name'].unique())
+    else:
+        valid_markets = sorted(df_base['Market Name'].unique())
+        
+    market = st.sidebar.selectbox("Select Market", valid_markets)
+    model, scaler = load_artifacts(selected_crop)
+    
+    # Cache Inspector Sidebar
+    if st.sidebar.checkbox("Show Cache Status"):
+        if os.path.exists(CACHE_FILE):
+            st.sidebar.success("Cache File Exists")
+            try:
+                c_df = pd.read_csv(CACHE_FILE)
+                st.sidebar.write(f"Entries: {len(c_df)}")
+                st.sidebar.dataframe(c_df.tail(3))
+            except: st.sidebar.error("Cache Corrupt")
+        else:
+            st.sidebar.warning("Cache Empty")
+
+    st.title(f"🌾 {selected_crop} Future Risk Calculator")
+    st.markdown("**Rolling Horizon Analysis:** Observed (Past) + Forecast (Next 2 Weeks) + Projection (Week 4).")
+    
+    if model is None:
+        st.error(f"Model artifacts for {selected_crop} not found. Run `train_all_crops.py`.")
+        st.stop()
     
     today = date.today()
-    
-    # Baseline Calculation
-    target_month_name = (today + timedelta(days=30)).strftime('%B') # Next month
-    historical_avgs = get_seasonal_averages(DEFAULT_COMMODITY, market, today.month)
+    future_target_date = today + timedelta(weeks=LAG_WINDOW)
+    historical_avgs = get_seasonal_averages(selected_crop, market, future_target_date.month)
     baseline_price = historical_avgs['Modal_Price']
     
     st.sidebar.divider()
-    st.sidebar.markdown(f"**Historical Baseline:**")
-    st.sidebar.markdown(f"# ₹{baseline_price:,.0f}")
-    st.sidebar.caption(f"Average for {market} around this time of year.")
+    st.sidebar.metric("Historical Norm", f"₹{baseline_price:,.0f}")
     
     st.divider()
     
@@ -315,78 +365,49 @@ def main():
         else:
             lat, lon = market_coords[market]['latitude_x'], market_coords[market]['longitude_x']
 
-        with st.spinner("Fetching Live Observations & Forecasts..."):
+        with st.spinner("Fetching weather data..."):
             
-            # 1. Unified Fetch (Past 7 days + Next 16 days)
-            df_api = fetch_unified_weather(lat, lon)
+            df_api, source_status = fetch_unified_weather(lat, lon)
             
             if not df_api.empty:
-                # 2. Build Hybrid Scenario
                 df_scenario = build_hybrid_scenario(df_api, historical_avgs)
+                simulated_data = aggregate_to_weekly_lags(df_scenario)
                 
-                # 3. Aggregate (Weekly)
-                simulated_data, df_weekly_view = aggregate_to_weekly_lags(df_scenario)
-                
-                # 4. Predict
-                feat_names = model.get_booster().feature_names
-                X_input = prepare_input_features(simulated_data, feat_names, baseline_price)
-                X_scaled = scaler.transform(X_input)
-                predicted_price = model.predict(X_scaled)[0]
-                
-                # --- Risk Metrics ---
-                deviation = predicted_price - baseline_price
-                pct_change = (deviation / baseline_price) * 100
-                
-                # Risk Logic
-                risk_score = min(max((pct_change + 10) * 2.5, 0), 100)
-                
-                col1, col2, col3 = st.columns(3)
-                
-                target_date_approx = today + timedelta(weeks=4)
-                
-                col1.metric(f"Projected Price ({target_date_approx.strftime('%b %d')})", 
-                           f"₹ {predicted_price:,.0f}", 
-                           delta=f"{pct_change:.1f}% vs Norm", delta_color="inverse")
-                
-                if risk_score > 60:
-                    risk_label, risk_color = "HIGH RISK", "red"
-                    risk_desc = "Weather mix (Observed + Forecast) indicates adverse conditions likely to spike prices."
-                elif risk_score > 30:
-                    risk_label, risk_color = "MODERATE RISK", "orange"
-                    risk_desc = "Conditions are slightly deviating from ideal, creating moderate price pressure."
-                else:
-                    risk_label, risk_color = "LOW RISK", "green"
-                    risk_desc = "Favorable weather conditions (Observed & Forecasted) suggest stable or lower prices."
+                try:
+                    feat_names = model.get_booster().feature_names
+                    X_input = prepare_input_features(simulated_data, feat_names, baseline_price)
+                    X_scaled = scaler.transform(X_input)
+                    predicted_price = model.predict(X_scaled)[0]
                     
-                col2.markdown(f"### Risk Level")
-                col2.markdown(f"<h2 style='color:{risk_color}'>{risk_label}</h2>", unsafe_allow_html=True)
-                col2.progress(int(risk_score) / 100)
-                
-                col3.info(risk_desc)
-                
-                # Visualization table
-                st.subheader("Data Timeline Analysis")
-                
-                # Clean up for display
-                display_cols = ['Data_Source', 'Week_Start', 'temperature_2m_max', 'precipitation_sum', 'weather_code']
-                display_df = pd.DataFrame(simulated_data)[display_cols]
-                
-                # Rename for clarity
-                display_df.columns = ['Source', 'Week Start', 'Max Temp (°C)', 'Rain (mm)', 'WMO Code']
-                
-                # Map codes to text
-                def code_to_text(c):
-                    if c == 0: return "Clear"
-                    if c < 3: return "Cloudy"
-                    if c < 60: return "Drizzle"
-                    if c < 80: return "Rain"
-                    return "Storm"
-                display_df['Condition'] = display_df['WMO Code'].apply(code_to_text)
-                
-                st.dataframe(display_df, use_container_width=True)
-                
+                    deviation = predicted_price - baseline_price
+                    pct_change = (deviation / baseline_price) * 100
+                    risk_score = min(max((pct_change + 10) * 2.5, 0), 100)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric(f"Projected Price", f"₹ {predicted_price:,.0f}", 
+                               delta=f"{pct_change:.1f}%", delta_color="inverse")
+                    
+                    if risk_score > 60:
+                        risk_label, risk_color = "HIGH RISK", "red"
+                        risk_desc = "Adverse weather conditions likely to spike prices."
+                    elif risk_score > 30:
+                        risk_label, risk_color = "MODERATE RISK", "orange"
+                        risk_desc = "Conditions slightly deviating from ideal."
+                    else:
+                        risk_label, risk_color = "LOW RISK", "green"
+                        risk_desc = "Favorable weather conditions."
+                        
+                    col2.markdown(f"### Risk Level")
+                    col2.markdown(f"<h2 style='color:{risk_color}'>{risk_label}</h2>", unsafe_allow_html=True)
+                    col2.progress(int(risk_score) / 100)
+                    col3.info(f"**Source:** {source_status}\n\n{risk_desc}")
+                    
+                    st.subheader("Data Timeline")
+                    st.dataframe(pd.DataFrame(simulated_data)[['Week_Start', 'temperature_2m_max', 'precipitation_sum', 'weather_code']], use_container_width=True)
+                except Exception as e:
+                    st.error(f"Prediction Error: {e}")
             else:
-                st.error("Could not fetch weather data.")
+                st.error(f"Could not fetch weather data. Status: {source_status}")
 
 if __name__ == "__main__":
     main()
